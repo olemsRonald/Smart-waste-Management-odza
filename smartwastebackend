@@ -1,0 +1,331 @@
+// server.js - Backend API for Smart Waste Management System
+
+const express = require('express');
+const cors = require('cors');
+const mongoose = require('mongoose');
+const mqtt = require('mqtt');
+require('dotenv').config();
+
+const app = express();
+const PORT = process.env.PORT || 5000;
+
+// Middleware
+app.use(cors());
+app.use(express.json());
+
+// MongoDB Connection
+mongoose.connect(process.env.MONGODB_URI || 'mongodb://localhost:27017/waste_management', {
+  useNewUrlParser: true,
+  useUnifiedTopology: true
+})
+.then(() => console.log('✅ MongoDB Connected'))
+.catch(err => console.error('❌ MongoDB Error:', err));
+
+// Bin Schema
+const binSchema = new mongoose.Schema({
+  binId: { type: String, required: true, unique: true },
+  name: { type: String, required: true },
+  location: {
+    lat: Number,
+    lng: Number,
+    address: String
+  },
+  fillLevel: { type: Number, default: 0 },
+  status: { type: String, enum: ['normal', 'warning', 'urgent'], default: 'normal' },
+  lastCollected: { type: Date, default: Date.now },
+  lastUpdated: { type: Date, default: Date.now },
+  temperature: Number,
+  batteryLevel: Number
+}, { timestamps: true });
+
+const Bin = mongoose.model('Bin', binSchema);
+
+// Collection Schema
+const collectionSchema = new mongoose.Schema({
+  binId: { type: String, required: true },
+  truckId: String,
+  collectedBy: String,
+  collectionTime: { type: Date, default: Date.now },
+  fillLevelBefore: Number,
+  notes: String
+}, { timestamps: true });
+
+const Collection = mongoose.model('Collection', collectionSchema);
+
+// Truck Schema
+const truckSchema = new mongoose.Schema({
+  truckId: { type: String, required: true, unique: true },
+  name: String,
+  status: { type: String, enum: ['active', 'idle', 'maintenance'], default: 'idle' },
+  currentLocation: {
+    lat: Number,
+    lng: Number
+  },
+  load: { type: Number, default: 0 },
+  driver: String,
+  lastUpdated: { type: Date, default: Date.now }
+}, { timestamps: true });
+
+const Truck = mongoose.model('Truck', truckSchema);
+
+// MQTT Connection for IoT devices
+const mqttClient = mqtt.connect(process.env.MQTT_BROKER || 'mqtt://broker.hivemq.com');
+
+mqttClient.on('connect', () => {
+  console.log('✅ MQTT Broker Connected');
+  mqttClient.subscribe('waste/bins/+/data', (err) => {
+    if (!err) console.log('📡 Subscribed to bin data');
+  });
+});
+
+mqttClient.on('message', async (topic, message) => {
+  try {
+    const data = JSON.parse(message.toString());
+    const binId = topic.split('/')[2];
+    
+    let status = 'normal';
+    if (data.fillLevel > 80) status = 'urgent';
+    else if (data.fillLevel > 50) status = 'warning';
+    
+    await Bin.findOneAndUpdate(
+      { binId },
+      {
+        fillLevel: data.fillLevel,
+        status,
+        temperature: data.temperature,
+        batteryLevel: data.batteryLevel,
+        lastUpdated: new Date()
+      },
+      { upsert: true, new: true }
+    );
+    
+    console.log(`📊 Updated bin ${binId}: ${data.fillLevel}%`);
+  } catch (error) {
+    console.error('Error processing MQTT message:', error);
+  }
+});
+
+// ============= API ROUTES =============
+
+// Get all bins
+app.get('/api/bins', async (req, res) => {
+  try {
+    const bins = await Bin.find().sort({ fillLevel: -1 });
+    res.json(bins);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Get single bin
+app.get('/api/bins/:id', async (req, res) => {
+  try {
+    const bin = await Bin.findOne({ binId: req.params.id });
+    if (!bin) return res.status(404).json({ error: 'Bin not found' });
+    res.json(bin);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Create new bin
+app.post('/api/bins', async (req, res) => {
+  try {
+    const bin = new Bin(req.body);
+    await bin.save();
+    res.status(201).json(bin);
+  } catch (error) {
+    res.status(400).json({ error: error.message });
+  }
+});
+
+// Update bin
+app.put('/api/bins/:id', async (req, res) => {
+  try {
+    const bin = await Bin.findOneAndUpdate(
+      { binId: req.params.id },
+      req.body,
+      { new: true }
+    );
+    if (!bin) return res.status(404).json({ error: 'Bin not found' });
+    res.json(bin);
+  } catch (error) {
+    res.status(400).json({ error: error.message });
+  }
+});
+
+// Get urgent bins
+app.get('/api/bins/status/urgent', async (req, res) => {
+  try {
+    const urgentBins = await Bin.find({ status: 'urgent' });
+    res.json(urgentBins);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Schedule collection
+app.post('/api/collections/schedule', async (req, res) => {
+  try {
+    const { binId, truckId, driver } = req.body;
+    
+    // Create collection record
+    const collection = new Collection({
+      binId,
+      truckId,
+      collectedBy: driver,
+      collectionTime: new Date()
+    });
+    
+    await collection.save();
+    
+    // Update bin status
+    await Bin.findOneAndUpdate(
+      { binId },
+      { status: 'scheduled' }
+    );
+    
+    res.status(201).json({ message: 'Collection scheduled', collection });
+  } catch (error) {
+    res.status(400).json({ error: error.message });
+  }
+});
+
+// Mark collection as completed
+app.post('/api/collections/complete', async (req, res) => {
+  try {
+    const { binId, truckId } = req.body;
+    
+    const bin = await Bin.findOne({ binId });
+    
+    const collection = new Collection({
+      binId,
+      truckId,
+      fillLevelBefore: bin.fillLevel,
+      collectionTime: new Date()
+    });
+    
+    await collection.save();
+    
+    // Reset bin
+    await Bin.findOneAndUpdate(
+      { binId },
+      { 
+        fillLevel: 0,
+        status: 'normal',
+        lastCollected: new Date()
+      }
+    );
+    
+    res.json({ message: 'Collection completed', collection });
+  } catch (error) {
+    res.status(400).json({ error: error.message });
+  }
+});
+
+// Get collection history
+app.get('/api/collections', async (req, res) => {
+  try {
+    const collections = await Collection.find()
+      .sort({ collectionTime: -1 })
+      .limit(100);
+    res.json(collections);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Get all trucks
+app.get('/api/trucks', async (req, res) => {
+  try {
+    const trucks = await Truck.find();
+    res.json(trucks);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Update truck location
+app.put('/api/trucks/:id/location', async (req, res) => {
+  try {
+    const { lat, lng } = req.body;
+    const truck = await Truck.findOneAndUpdate(
+      { truckId: req.params.id },
+      { 
+        currentLocation: { lat, lng },
+        lastUpdated: new Date()
+      },
+      { new: true }
+    );
+    res.json(truck);
+  } catch (error) {
+    res.status(400).json({ error: error.message });
+  }
+});
+
+// Get statistics
+app.get('/api/stats', async (req, res) => {
+  try {
+    const totalBins = await Bin.countDocuments();
+    const urgentBins = await Bin.countDocuments({ status: 'urgent' });
+    const warningBins = await Bin.countDocuments({ status: 'warning' });
+    
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
+    const collectionsToday = await Collection.countDocuments({
+      collectionTime: { $gte: today }
+    });
+    
+    const avgFillLevel = await Bin.aggregate([
+      { $group: { _id: null, avg: { $avg: '$fillLevel' } } }
+    ]);
+    
+    res.json({
+      totalBins,
+      urgentBins,
+      warningBins,
+      collectionsToday,
+      averageFillLevel: avgFillLevel[0]?.avg || 0,
+      efficiency: Math.max(0, 100 - (urgentBins / totalBins * 100))
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Optimize route (simple algorithm)
+app.post('/api/routes/optimize', async (req, res) => {
+  try {
+    const urgentBins = await Bin.find({ status: 'urgent' })
+      .sort({ fillLevel: -1 });
+    
+    // Simple nearest-neighbor algorithm
+    const route = urgentBins.map((bin, index) => ({
+      order: index + 1,
+      binId: bin.binId,
+      name: bin.name,
+      location: bin.location,
+      fillLevel: bin.fillLevel,
+      estimatedTime: (index + 1) * 15 // 15 min per stop
+    }));
+    
+    res.json({ route, totalStops: route.length });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Health check
+app.get('/health', (req, res) => {
+  res.json({ 
+    status: 'OK', 
+    timestamp: new Date(),
+    service: 'Smart Waste Management API'
+  });
+});
+
+// Start server
+app.listen(PORT, () => {
+  console.log(`🚀 Server running on port ${PORT}`);
+  console.log(`📡 API available at http://localhost:${PORT}/api`);
+});
