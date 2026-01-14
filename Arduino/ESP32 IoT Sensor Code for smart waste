@@ -1,0 +1,290 @@
+/*
+ * Smart Waste Bin - IoT Sensor Code
+ * ESP32 with Ultrasonic Sensor, GPS, and 4G Module
+ * 
+ * Hardware Required:
+ * - ESP32 Development Board
+ * - HC-SR04 Ultrasonic Sensor
+ * - NEO-6M GPS Module
+ * - SIM7600 4G Module
+ * - Solar Panel + Battery Management System
+ */
+
+#include <WiFi.h>
+#include <PubSubClient.h>
+#include <TinyGPS++.h>
+#include <ArduinoJson.h>
+
+// ========== CONFIGURATION ==========
+#define BIN_ID "BIN_001"  // Unique identifier for this bin
+
+// Ultrasonic Sensor Pins
+#define TRIG_PIN 5
+#define ECHO_PIN 18
+
+// GPS Serial
+#define GPS_RX 16
+#define GPS_TX 17
+
+// Temperature Sensor
+#define TEMP_PIN 34
+
+// Battery Monitoring
+#define BATTERY_PIN 35
+
+// Bin Dimensions
+#define BIN_HEIGHT 100  // cm
+#define BIN_DEPTH 10    // cm (sensor offset from top)
+
+// WiFi/4G Credentials
+const char* ssid = "YOUR_WIFI_SSID";
+const char* password = "YOUR_WIFI_PASSWORD";
+
+// MQTT Broker
+const char* mqtt_server = "broker.hivemq.com";
+const int mqtt_port = 1883;
+const char* mqtt_topic = "waste/bins/" BIN_ID "/data";
+
+// ========== GLOBAL OBJECTS ==========
+WiFiClient espClient;
+PubSubClient mqttClient(espClient);
+TinyGPSPlus gps;
+HardwareSerial gpsSerial(1);
+
+// ========== VARIABLES ==========
+float fillLevel = 0;
+float temperature = 0;
+float batteryLevel = 0;
+double latitude = 0;
+double longitude = 0;
+unsigned long lastSendTime = 0;
+const unsigned long sendInterval = 60000; // Send data every 60 seconds
+
+// ========== SETUP ==========
+void setup() {
+  Serial.begin(115200);
+  
+  // Initialize pins
+  pinMode(TRIG_PIN, OUTPUT);
+  pinMode(ECHO_PIN, INPUT);
+  pinMode(TEMP_PIN, INPUT);
+  pinMode(BATTERY_PIN, INPUT);
+  
+  // Initialize GPS
+  gpsSerial.begin(9600, SERIAL_8N1, GPS_RX, GPS_TX);
+  
+  // Connect to WiFi
+  connectWiFi();
+  
+  // Setup MQTT
+  mqttClient.setServer(mqtt_server, mqtt_port);
+  connectMQTT();
+  
+  Serial.println("✅ Smart Bin Initialized");
+  Serial.println("Bin ID: " + String(BIN_ID));
+}
+
+// ========== MAIN LOOP ==========
+void loop() {
+  // Maintain MQTT connection
+  if (!mqttClient.connected()) {
+    connectMQTT();
+  }
+  mqttClient.loop();
+  
+  // Update GPS data
+  while (gpsSerial.available() > 0) {
+    gps.encode(gpsSerial.read());
+  }
+  
+  // Read sensors
+  fillLevel = readFillLevel();
+  temperature = readTemperature();
+  batteryLevel = readBatteryLevel();
+  
+  if (gps.location.isValid()) {
+    latitude = gps.location.lat();
+    longitude = gps.location.lng();
+  }
+  
+  // Send data at intervals
+  if (millis() - lastSendTime >= sendInterval) {
+    sendData();
+    lastSendTime = millis();
+  }
+  
+  // Display on Serial Monitor
+  printStatus();
+  
+  delay(5000);
+}
+
+// ========== SENSOR FUNCTIONS ==========
+
+float readFillLevel() {
+  // Trigger ultrasonic pulse
+  digitalWrite(TRIG_PIN, LOW);
+  delayMicroseconds(2);
+  digitalWrite(TRIG_PIN, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(TRIG_PIN, LOW);
+  
+  // Read echo
+  long duration = pulseIn(ECHO_PIN, HIGH);
+  float distance = duration * 0.034 / 2; // Convert to cm
+  
+  // Calculate fill level percentage
+  float wasteHeight = (BIN_HEIGHT - BIN_DEPTH) - distance;
+  float percentage = (wasteHeight / (BIN_HEIGHT - BIN_DEPTH)) * 100;
+  
+  // Constrain between 0-100
+  percentage = constrain(percentage, 0, 100);
+  
+  return percentage;
+}
+
+float readTemperature() {
+  // Read analog temperature sensor (LM35 or similar)
+  int sensorValue = analogRead(TEMP_PIN);
+  float voltage = sensorValue * (3.3 / 4095.0);
+  float temp = voltage * 100; // LM35: 10mV per degree
+  return temp;
+}
+
+float readBatteryLevel() {
+  // Read battery voltage through voltage divider
+  int sensorValue = analogRead(BATTERY_PIN);
+  float voltage = sensorValue * (3.3 / 4095.0) * 2; // Adjust multiplier based on divider
+  
+  // Assume 3.7V Li-ion battery (3.0V = 0%, 4.2V = 100%)
+  float percentage = ((voltage - 3.0) / (4.2 - 3.0)) * 100;
+  percentage = constrain(percentage, 0, 100);
+  
+  return percentage;
+}
+
+// ========== CONNECTIVITY FUNCTIONS ==========
+
+void connectWiFi() {
+  Serial.print("Connecting to WiFi");
+  WiFi.begin(ssid, password);
+  
+  int attempts = 0;
+  while (WiFi.status() != WL_CONNECTED && attempts < 20) {
+    delay(500);
+    Serial.print(".");
+    attempts++;
+  }
+  
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("\n✅ WiFi Connected");
+    Serial.print("IP Address: ");
+    Serial.println(WiFi.localIP());
+  } else {
+    Serial.println("\n❌ WiFi Connection Failed");
+  }
+}
+
+void connectMQTT() {
+  while (!mqttClient.connected()) {
+    Serial.print("Connecting to MQTT Broker...");
+    
+    String clientId = "SmartBin_" + String(BIN_ID);
+    
+    if (mqttClient.connect(clientId.c_str())) {
+      Serial.println(" ✅ Connected");
+    } else {
+      Serial.print(" ❌ Failed, rc=");
+      Serial.print(mqttClient.state());
+      Serial.println(" Retrying in 5 seconds");
+      delay(5000);
+    }
+  }
+}
+
+// ========== DATA TRANSMISSION ==========
+
+void sendData() {
+  // Create JSON document
+  StaticJsonDocument<256> doc;
+  
+  doc["binId"] = BIN_ID;
+  doc["fillLevel"] = round(fillLevel * 10) / 10.0;
+  doc["temperature"] = round(temperature * 10) / 10.0;
+  doc["batteryLevel"] = round(batteryLevel);
+  doc["latitude"] = latitude;
+  doc["longitude"] = longitude;
+  doc["timestamp"] = millis();
+  
+  // Determine status
+  String status = "normal";
+  if (fillLevel > 80) status = "urgent";
+  else if (fillLevel > 50) status = "warning";
+  doc["status"] = status;
+  
+  // Serialize to JSON string
+  char jsonBuffer[256];
+  serializeJson(doc, jsonBuffer);
+  
+  // Publish to MQTT
+  if (mqttClient.publish(mqtt_topic, jsonBuffer)) {
+    Serial.println("📤 Data sent successfully");
+  } else {
+    Serial.println("❌ Failed to send data");
+  }
+}
+
+void printStatus() {
+  Serial.println("\n========== BIN STATUS ==========");
+  Serial.print("Bin ID: ");
+  Serial.println(BIN_ID);
+  Serial.print("Fill Level: ");
+  Serial.print(fillLevel);
+  Serial.println("%");
+  Serial.print("Temperature: ");
+  Serial.print(temperature);
+  Serial.println("°C");
+  Serial.print("Battery: ");
+  Serial.print(batteryLevel);
+  Serial.println("%");
+  Serial.print("Location: ");
+  Serial.print(latitude, 6);
+  Serial.print(", ");
+  Serial.println(longitude, 6);
+  Serial.println("==============================\n");
+}
+
+// ========== UTILITY FUNCTIONS ==========
+
+void checkAlerts() {
+  // Fire hazard detection
+  if (temperature > 60) {
+    sendAlert("FIRE_RISK", "High temperature detected: " + String(temperature) + "°C");
+  }
+  
+  // Low battery warning
+  if (batteryLevel < 20) {
+    sendAlert("LOW_BATTERY", "Battery level: " + String(batteryLevel) + "%");
+  }
+  
+  // Critical fill level
+  if (fillLevel > 95) {
+    sendAlert("OVERFLOW_RISK", "Bin almost full: " + String(fillLevel) + "%");
+  }
+}
+
+void sendAlert(String alertType, String message) {
+  StaticJsonDocument<256> doc;
+  doc["binId"] = BIN_ID;
+  doc["alertType"] = alertType;
+  doc["message"] = message;
+  doc["timestamp"] = millis();
+  
+  char jsonBuffer[256];
+  serializeJson(doc, jsonBuffer);
+  
+  String alertTopic = "waste/bins/" + String(BIN_ID) + "/alerts";
+  mqttClient.publish(alertTopic.c_str(), jsonBuffer);
+  
+  Serial.println("🚨 ALERT: " + alertType + " - " + message);
+}
